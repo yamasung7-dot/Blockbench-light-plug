@@ -1,10 +1,10 @@
 /*
  * Blockbench Light Plug
- * Native Blockbench lighting / rendering studio.
+ * Native Blockbench lighting / rendering studio with PBR parallax mapping.
  */
 
 const BB_LIGHT_PLUG_ID = 'blockbench_light_plug';
-const BB_LIGHT_PLUG_VERSION = '0.3.0';
+const BB_LIGHT_PLUG_VERSION = '0.4.0';
 const BB_LIGHT_GROUP = 'blockbench_light_plug';
 const BB_LIGHT_PLUG_ICON = 'wb_sunny';
 
@@ -31,7 +31,10 @@ const DEFAULT_SETTINGS = {
     dofStrength: 0.25,
     shadows: true,
     fov: 45,
-    resolution: 2
+    resolution: 2,
+    parallax: true,
+    parallaxDepth: 0.045,
+    parallaxSteps: 24
 };
 
 const studio = {
@@ -39,7 +42,8 @@ const studio = {
     original: null,
     preview: null,
     running: false,
-    settings: Object.assign({}, DEFAULT_SETTINGS)
+    settings: Object.assign({}, DEFAULT_SETTINGS),
+    parallaxMaterials: new Map()
 };
 
 function hasProject() {
@@ -258,6 +262,166 @@ function applyRendererSettings() {
     }
 }
 
+/*
+ * Blockbench's native PBR material already converts a height channel into
+ * material.bumpMap. We use that exact native map as the parallax source,
+ * so the model, UVs and texture remain owned by Blockbench.
+ */
+function restoreParallaxMaterials() {
+    studio.parallaxMaterials.forEach((record, material) => {
+        try {
+            material.onBeforeCompile = record.onBeforeCompile;
+            if (record.customProgramCacheKey !== undefined) {
+                material.customProgramCacheKey = record.customProgramCacheKey;
+            }
+            material.needsUpdate = true;
+        } catch (e) {}
+    });
+    studio.parallaxMaterials.clear();
+}
+
+function parallaxProgramKey(material) {
+    const s = studio.settings;
+    const mapId = material.bumpMap?.uuid || 'none';
+    return `bb_light_plug_parallax_${s.parallax ? 1 : 0}_${mapId}_${Number(s.parallaxSteps) | 0}`;
+}
+
+function applyParallaxToMaterial(material) {
+    if (!material || !material.isMeshStandardMaterial || typeof material.onBeforeCompile === 'undefined') return false;
+    if (!material.bumpMap) return false;
+
+    const existing = studio.parallaxMaterials.get(material);
+    if (!existing) {
+        studio.parallaxMaterials.set(material, {
+            onBeforeCompile: material.onBeforeCompile,
+            customProgramCacheKey: material.customProgramCacheKey
+        });
+    }
+
+    const originalOnBeforeCompile = studio.parallaxMaterials.get(material).onBeforeCompile;
+    material.onBeforeCompile = function(shader, renderer) {
+        if (typeof originalOnBeforeCompile === 'function') {
+            originalOnBeforeCompile.call(this, shader, renderer);
+        }
+
+        shader.uniforms.bbParallaxHeightMap = { value: this.bumpMap };
+        shader.uniforms.bbParallaxDepthScale = { value: Number(studio.settings.parallaxDepth) || 0.045 };
+        shader.uniforms.bbParallaxStepCount = { value: Math.max(4, Math.min(48, Number(studio.settings.parallaxSteps) || 24)) };
+
+        const mapChunk = '#include <map_fragment>';
+        if (!shader.fragmentShader.includes(mapChunk)) return;
+
+        const parallax = `
+            vec2 bbParallaxUv = vMapUv;
+            float bbDepthScale = bbParallaxDepthScale;
+            int bbStepCount = bbParallaxStepCount;
+
+            // Derivative-built TBN keeps this compatible with Blockbench's cube UV geometry
+            // without changing or requiring tangent attributes.
+            vec3 bbQ1 = dFdx(-vViewPosition);
+            vec3 bbQ2 = dFdy(-vViewPosition);
+            vec2 bbSt1 = dFdx(vMapUv);
+            vec2 bbSt2 = dFdy(vMapUv);
+            vec3 bbT = normalize(bbQ1 * bbSt2.y - bbQ2 * bbSt1.y);
+            vec3 bbB = normalize(-bbQ1 * bbSt2.x + bbQ2 * bbSt1.x);
+            vec3 bbN = normalize(cross(bbT, bbB));
+            if (!gl_FrontFacing) bbN = -bbN;
+            vec3 bbViewTS = normalize(vec3(
+                dot(normalize(-vViewPosition), bbT),
+                dot(normalize(-vViewPosition), bbB),
+                dot(normalize(-vViewPosition), bbN)
+            ));
+
+            float bbLayers = mix(float(bbStepCount), 8.0, abs(bbViewTS.z));
+            float bbLayerDepth = 1.0 / bbLayers;
+            float bbCurrentLayerDepth = 0.0;
+            vec2 bbP = bbViewTS.xy / max(abs(bbViewTS.z), 0.12) * (bbDepthScale / bbLayers);
+            vec2 bbCurrentUv = bbParallaxUv;
+            float bbCurrentDepth = texture2D(bbParallaxHeightMap, bbCurrentUv).r;
+
+            for (int bbStep = 0; bbStep < 48; bbStep++) {
+                if (bbStep >= bbStepCount) break;
+                if (bbCurrentDepth < bbCurrentLayerDepth) break;
+                bbCurrentUv -= bbP;
+                bbCurrentDepth = texture2D(bbParallaxHeightMap, bbCurrentUv).r;
+                bbCurrentLayerDepth += bbLayerDepth;
+            }
+
+            vec2 bbPrevUv = bbCurrentUv + bbP;
+            float bbAfterDepth = bbCurrentDepth - bbCurrentLayerDepth;
+            float bbBeforeDepth = texture2D(bbParallaxHeightMap, bbPrevUv).r - (bbCurrentLayerDepth - bbLayerDepth);
+            float bbWeight = bbAfterDepth / max(bbAfterDepth - bbBeforeDepth, 0.0001);
+            bbParallaxUv = mix(bbCurrentUv, bbPrevUv, clamp(bbWeight, 0.0, 1.0));
+
+            // Redirect the native StandardMaterial UV consumers to the parallax UV.
+            #define vMapUv bbParallaxUv
+            #ifdef USE_NORMALMAP
+                #define vNormalMapUv bbParallaxUv
+            #endif
+            #ifdef USE_ROUGHNESSMAP
+                #define vRoughnessMapUv bbParallaxUv
+            #endif
+            #ifdef USE_METALNESSMAP
+                #define vMetalnessMapUv bbParallaxUv
+            #endif
+            #ifdef USE_EMISSIVEMAP
+                #define vEmissiveMapUv bbParallaxUv
+            #endif
+            #ifdef USE_AOMAP
+                #define vAoMapUv bbParallaxUv
+            #endif
+        `;
+
+        shader.fragmentShader = shader.fragmentShader.replace(mapChunk, parallax + '\n' + mapChunk);
+    };
+
+    material.customProgramCacheKey = function() {
+        return parallaxProgramKey(material);
+    };
+    material.needsUpdate = true;
+    return true;
+}
+
+function applyParallax() {
+    if (typeof THREE === 'undefined' || !Canvas?.scene) return 0;
+
+    if (!studio.settings.parallax) {
+        restoreParallaxMaterials();
+        return 0;
+    }
+
+    let applied = 0;
+    const seen = new Set();
+
+    // Native PBR materials are attached to material groups in Material Preview.
+    if (typeof TextureGroup !== 'undefined' && TextureGroup.all) {
+        TextureGroup.all.forEach(group => {
+            try {
+                if (!group.is_material) return;
+                const material = group.getMaterial();
+                if (material && !seen.has(material)) {
+                    seen.add(material);
+                    if (applyParallaxToMaterial(material)) applied++;
+                }
+            } catch (e) {}
+        });
+    }
+
+    // Also catch materials currently assigned directly to preview meshes.
+    Canvas.scene.traverse(object => {
+        if (!object.isMesh) return;
+        const materials = Array.isArray(object.material) ? object.material : [object.material];
+        materials.forEach(material => {
+            if (material && !seen.has(material)) {
+                seen.add(material);
+                if (applyParallaxToMaterial(material)) applied++;
+            }
+        });
+    });
+
+    return applied;
+}
+
 function applyStudio() {
     if (!hasProject()) {
         Blockbench.showQuickMessage('Open a Blockbench model first');
@@ -272,6 +436,7 @@ function applyStudio() {
     refreshNativeMaterials();
     buildStudioLights();
     applyRendererSettings();
+    applyParallax();
 
     try {
         studio.preview.render();
@@ -475,6 +640,7 @@ function renderPNG() {
 }
 
 function resetStudio() {
+    restoreParallaxMaterials();
     studio.settings = Object.assign({}, DEFAULT_SETTINGS);
     applyStudio();
 }
@@ -509,7 +675,7 @@ function removeEventListeners() {
 Plugin.register(BB_LIGHT_PLUG_ID, {
     title: 'Blockbench Light Plug',
     author: 'Yama Sung',
-    description: 'Native Blockbench lighting and cinematic PNG rendering with native textures, UVs and PBR materials.',
+    description: 'Native Blockbench lighting and cinematic PNG rendering with native textures, UVs, PBR materials and parallax depth.',
     icon: BB_LIGHT_PLUG_ICON,
     version: BB_LIGHT_PLUG_VERSION,
     min_version: '5.0.0',
@@ -523,11 +689,11 @@ Plugin.register(BB_LIGHT_PLUG_ID, {
             name: 'Light Studio',
             icon: BB_LIGHT_PLUG_ICON,
             condition: () => hasProject(),
-            default_position: { slot: 'right_bar', height: 560 },
+            default_position: { slot: 'right_bar', height: 650 },
             component: {
                 template: `<div class="bb-light-plug-panel" style="padding:10px;overflow:auto;max-height:calc(100vh - 100px)">
                     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
-                        <div><h3 style="margin:0">Light Studio</h3><div style="font-size:11px;opacity:.65">Native scene + native PBR</div></div>
+                        <div><h3 style="margin:0">Light Studio</h3><div style="font-size:11px;opacity:.65">Native scene + native PBR + parallax</div></div>
                         <button class="tool_button" @click="reset"><i class="material-icons">restart_alt</i></button>
                     </div>
 
@@ -560,6 +726,23 @@ Plugin.register(BB_LIGHT_PLUG_ID, {
                     </div>
 
                     <div style="border:1px solid var(--color-border);border-radius:6px;padding:8px;margin-bottom:8px">
+                        <b>PBR Parallax</b>
+                        <div style="font-size:11px;opacity:.7;margin:5px 0 8px">Uses Blockbench's native height channel for view-dependent surface depth. No material or texture data is replaced.</div>
+                        <label style="display:block"><input type="checkbox" v-model="parallax" @change="changed('parallax',parallax)"> Parallax depth</label>
+                        <label style="display:block">Depth <input type="range" min="0" max="0.12" step="0.005" v-model.number="parallaxDepth" @input="changed('parallaxDepth',parallaxDepth)"> {{parallaxDepth.toFixed(3)}}</label>
+                        <label style="display:block">Quality
+                            <select v-model.number="parallaxSteps" @change="changed('parallaxSteps',parallaxSteps)">
+                                <option :value="8">8 steps</option>
+                                <option :value="16">16 steps</option>
+                                <option :value="24">24 steps</option>
+                                <option :value="32">32 steps</option>
+                                <option :value="48">48 steps</option>
+                            </select>
+                        </label>
+                        <div style="font-size:10px;opacity:.55;margin-top:5px">Best results require a PBR material with a height map.</div>
+                    </div>
+
+                    <div style="border:1px solid var(--color-border);border-radius:6px;padding:8px;margin-bottom:8px">
                         <b>Native PBR pipeline</b>
                         <div style="font-size:11px;opacity:.7;margin:5px 0 8px">Blockbench remains the source of truth for geometry, UVs, textures and PBR channels.</div>
                         <button class="tool_button" style="width:100%" @click="refresh"><i class="material-icons">refresh</i> Refresh native PBR materials</button>
@@ -574,7 +757,7 @@ Plugin.register(BB_LIGHT_PLUG_ID, {
                         </select>
                         <button class="tool_button" style="flex:1" @click="render"><i class="material-icons">image</i> Render PNG</button>
                     </div>
-                    <div style="font-size:10px;opacity:.55;margin-top:8px;line-height:1.4">Lighting, shadows, exposure and fog affect the live preview. Color grading, bloom and depth-of-field are applied to the final PNG.</div>
+                    <div style="font-size:10px;opacity:.55;margin-top:8px;line-height:1.4">Lighting, shadows, exposure, fog and parallax affect the live preview. Color grading, bloom and depth-of-field are applied to the final PNG.</div>
                 </div>`,
                 data() {
                     return Object.assign({}, studio.settings);
@@ -583,11 +766,14 @@ Plugin.register(BB_LIGHT_PLUG_ID, {
                     changed(key, value) { setStudioValue(key, value); },
                     refresh() {
                         const count = refreshNativeMaterials();
+                        applyParallax();
                         Blockbench.showQuickMessage(`Refreshed ${count} native material${count === 1 ? '' : 's'}`);
                     },
                     render() { renderPNG(); },
                     reset() {
-                        resetStudio();
+                        restoreParallaxMaterials();
+                        studio.settings = Object.assign({}, DEFAULT_SETTINGS);
+                        applyStudio();
                         Object.assign(this, studio.settings);
                     }
                 }
@@ -617,6 +803,7 @@ Plugin.register(BB_LIGHT_PLUG_ID, {
             condition: () => hasProject(),
             click() {
                 const count = refreshNativeMaterials();
+                applyParallax();
                 Blockbench.showQuickMessage(`Refreshed ${count} native material${count === 1 ? '' : 's'}`);
             }
         });
@@ -636,6 +823,7 @@ Plugin.register(BB_LIGHT_PLUG_ID, {
     onunload() {
         studio.running = false;
         removeEventListeners();
+        restoreParallaxMaterials();
         const preview = studio.preview || getPreview();
         if (preview?.renderer) restoreRenderer(preview.renderer);
         removeStudioLights();
