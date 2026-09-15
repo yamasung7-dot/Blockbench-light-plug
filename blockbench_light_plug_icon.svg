@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+<defs>
+ <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#172335"/><stop offset="1" stop-color="#07101c"/></linearGradient>
+ <linearGradient id="cube" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#8fe9ff"/><stop offset="1" stop-color="#2587d8"/></linearGradient>
+ <linearGradient id="beam" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#fff6b5" stop-opacity=".95"/><stop offset="1" stop-color="#63d8ff" stop-opacity=".15"/></linearGradient>
+ <filter id="glow"><feGaussianBlur stdDeviation="7" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+ <filter id="shadow"><feDropShadow dx="0" dy="10" stdDeviation="9" flood-opacity=".45"/></filter>
+</defs>
+<rect x="8" y="8" width="240" height="240" rx="52" fill="url(#bg)"/>
+<path d="M55 69 L164 39 L207 73 L96 105 Z" fill="url(#beam)" opacity=".85" filter="url(#glow)"/>
+<path d="M65 91 L143 69 L194 99 L116 123 Z" fill="#dffbff" opacity=".18"/>
+<g filter="url(#shadow)">
+ <path d="M58 107 L130 83 L198 122 L126 148 Z" fill="url(#cube)"/>
+ <path d="M58 107 L126 148 L126 211 L58 169 Z" fill="#216cae"/>
+ <path d="M126 148 L198 122 L198 184 L126 211 Z" fill="#2d92d2"/>
+ <path d="M58 107 L130 83 L198 122 L126 148 Z" fill="none" stroke="#b8f5ff" stroke-width="3" stroke-linejoin="round"/>
+ <path d="M126 148 V211" stroke="#8ee8ff" stroke-width="3"/>
+ <path d="M58 107 V169" stroke="#73cfff" stroke-width="3"/>
+ <path d="M198 122 V184" stroke="#8bdfff" stroke-width="3"/>
+</g>
+<g filter="url(#glow)">
+ <circle cx="181" cy="62" r="10" fill="#fff4a3"/>
+ <path d="M177 40 V28 M197 47 L205 39 M204 65 H216" stroke="#fff4a3" stroke-width="4" stroke-linecap="round"/>
+</g>
+</svg>
